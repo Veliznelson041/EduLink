@@ -119,7 +119,7 @@ Incluye herramientas exclusivas para facilitar el aprendizaje:
 
 ---
 
-## 📦 **Instalación (Opcional, pero profesional)**
+## 📦 **Instalación**
 
 ```bash
 git clone https://github.com/TU_USUARIO/EduLink.git
