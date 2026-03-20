@@ -39,6 +39,12 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 
+from .models import Promocion
+
+from django.db import models
+
+from django.db.models.functions import Coalesce
+
 
 # Agregar estas funciones utilitarias al inicio de views.py
 def crear_notificacion(usuario, tipo, mensaje, enlace=''):
@@ -1081,6 +1087,13 @@ def dashboard_maestro(request):
     tareas_pendientes = request.user.tarea_set.filter(completada=False).count()
     tareas_completadas = request.user.tarea_set.filter(completada=True).count()
 
+    # Promociones activas
+    promociones_activas = Promocion.objects.filter(
+    activa=True,
+    fecha_inicio__lte=timezone.now(),
+    fecha_fin__gte=timezone.now()
+    )
+
     context = {
         "solicitudes_pendientes": solicitudes_pendientes,
         "clases_esta_semana": clases_esta_semana,
@@ -1096,6 +1109,7 @@ def dashboard_maestro(request):
         "total_tareas": total_tareas,
         "tareas_pendientes": tareas_pendientes,
         "tareas_completadas": tareas_completadas,
+        "promociones_activas": promociones_activas,
     }
 
     return render(request, "cuentas/dashboard_maestro.html", context)
@@ -1743,65 +1757,114 @@ def proponer_fecha_solicitud(request, solicitud_id):
 
 
 
+from django.utils import timezone
+from django.contrib import messages
+from django.shortcuts import get_object_or_404, redirect, render
 
+from .models import Voucher
 
 # Vista para que el alumno confirme la fecha
 @login_required
 def confirmar_fecha_solicitud(request, solicitud_id):
     solicitud = get_object_or_404(SolicitudClase, id=solicitud_id)
-    
-    # Verificar que el alumno es el dueño de la solicitud y que está en estado 'propuesta'
+
+    # Verificar que el alumno es el dueño de la solicitud
     if solicitud.alumno.usuario != request.user:
         messages.error(request, "No tienes permiso para esta acción.")
         return redirect('mis_solicitudes_alumno')
-    
+
     if solicitud.estado != 'propuesta':
         messages.error(request, "Esta solicitud no tiene una propuesta pendiente de confirmación.")
         return redirect('mis_solicitudes_alumno')
-    
+
     if request.method == 'POST':
         form = ConfirmarFechaForm(request.POST, instance=solicitud)
         if form.is_valid():
             try:
                 solicitud = form.save(commit=False)
+
+                # ==========================
+                # Aplicar voucher si existe
+                # ==========================
+                codigo_voucher = request.POST.get('codigo_voucher', '').strip()
+
+                if codigo_voucher:
+                    try:
+                        voucher = Voucher.objects.select_related('promocion').get(
+                            codigo=codigo_voucher,
+                            usado=False,
+                            promocion__activa=True,
+                            promocion__fecha_inicio__lte=timezone.now(),
+                            promocion__fecha_fin__gte=timezone.now()
+                        )
+                        promocion = voucher.promocion
+                        monto_original = solicitud.monto_acordado
+                        descuento = 0
+                        monto_final = monto_original
+
+                        if promocion.tipo == 'descuento_porcentaje':
+                            descuento = monto_original * (promocion.valor / 100)
+                            monto_final = monto_original - descuento
+                        elif promocion.tipo == 'descuento_monto':
+                            descuento = promocion.valor
+                            monto_final = monto_original - descuento
+                        elif promocion.tipo == 'clase_gratuita':
+                            monto_final = 0
+                            descuento = monto_original
+                        # otros tipos (grupo) se pueden implementar después
+
+                        monto_final = max(monto_final, 0)
+
+                        solicitud.monto_original = monto_original
+                        solicitud.monto_final = monto_final
+                        solicitud.promocion_aplicada = promocion
+                        solicitud.voucher_usado = voucher
+
+                        # Marcar voucher como usado
+                        voucher.usado = True
+                        voucher.fecha_uso = timezone.now()
+                        voucher.alumno = solicitud.alumno  # si el modelo tiene este campo
+                        voucher.save()
+
+                        messages.success(request, f'Voucher aplicado. Descuento: ${descuento:.2f}')
+
+                    except Voucher.DoesNotExist:
+                        messages.error(request, 'Voucher inválido o expirado')
+
+                # ==========================
+                # Confirmar clase
+                # ==========================
                 solicitud.estado = 'aceptada'
-                
-                # ✅ INICIALIZAR EL ESTADO DEL PAGO CORRECTAMENTE
-                solicitud.estado_pago = 'pendiente'  # Esto es crucial
-                
-                # Si no se modifica la fecha, usar la propuesta por defecto
+                solicitud.estado_pago = 'pendiente'
                 if not solicitud.fecha_clase_confirmada:
                     solicitud.fecha_clase_confirmada = solicitud.fecha_clase_propuesta
-                
                 solicitud.save()
-                
-                # Crear notificación para el maestro
+
+                # Notificar al maestro
                 crear_notificacion(
                     usuario=solicitud.maestro.usuario,
                     tipo='clase_aceptada',
                     mensaje=f'El alumno {solicitud.alumno.usuario.get_full_name()} ha aceptado tu propuesta para la clase de {solicitud.materia.nombre}',
                     enlace=f'/maestro/solicitudes/'
                 )
-                
+
                 messages.success(request, '✅ ¡Clase confirmada! La clase ha sido agendada.')
-                
-                # Redirigir a la página de pago si no es efectivo
+
                 if solicitud.metodo_pago != 'efectivo':
                     return redirect('generar_qr_pago', solicitud_id=solicitud.id)
                 else:
-                    # ✅ Para pagos en efectivo, redirigir al control de gastos
                     return redirect('control_gastos_alumno')
-                    
+
             except Exception as e:
                 messages.error(request, f'❌ Error al confirmar la clase: {str(e)}')
+
     else:
-        # Inicializar con la fecha propuesta
         initial_data = {
             'fecha_clase_confirmada': solicitud.fecha_clase_propuesta,
             'metodo_pago': solicitud.metodo_pago
         }
         form = ConfirmarFechaForm(instance=solicitud, initial=initial_data)
-    
+
     return render(request, 'alumno/confirmar_fecha.html', {
         'form': form,
         'solicitud': solicitud
@@ -2916,53 +2979,66 @@ def biblioteca_formulas(request):
 # ==============================
 # 🔄 Datos de respaldo (sin API)
 # ==============================
-def obtener_elementos_respaldo():
-    return [
-        {'simbolo': 'H', 'nombre': 'Hidrógeno', 'numero': 1, 'masa': 1.008, 'grupo': 1, 'periodo': 1, 'categoria': 'diatomic nonmetal'},
-        {'simbolo': 'He', 'nombre': 'Helio', 'numero': 2, 'masa': 4.0026, 'grupo': 18, 'periodo': 1, 'categoria': 'noble gas'},
-    ]
+
+##### DIRECTAMENTE LE HICE UN JSON ##### 
+import json
+import os
+import requests
+from django.conf import settings
+from django.http import JsonResponse
+from django.shortcuts import render
+from django.contrib.auth.decorators import login_required
 
 
-# ==============================
-# ⚛️ Tabla periódica (versión única AJAX + render)
-# ==============================
 @login_required
 def tabla_periodica(request):
     """Vista unificada: devuelve JSON si es AJAX, o renderiza HTML si es GET normal."""
 
-    # -------------------------
-    # 🔹 Si es petición AJAX → devolver JSON
-    # -------------------------
+    # Función para cargar elementos locales
+    def cargar_elementos_locales():
+        json_path = os.path.join(settings.BASE_DIR, 'static', 'data', 'elementos.json')
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+                return [
+                {'simbolo': 'H', 'nombre': 'Hidrógeno', 'numero': 1, 'masa': 1.008, 'grupo': 1, 'periodo': 1, 'categoria': 'diatomic nonmetal'},
+                {'simbolo': 'He', 'nombre': 'Helio', 'numero': 2, 'masa': 4.0026, 'grupo': 18, 'periodo': 1, 'categoria': 'noble gas'},
+            ]
+
+    # Si es petición AJAX → devolver JSON
     if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
         try:
             api_url = "https://periodic-table-api.herokuapp.com/elements"
-            response = requests.get(api_url, timeout=10)
+            response = requests.get(api_url, timeout=5)
 
             if response.status_code == 200:
                 return JsonResponse({
                     'success': True,
                     'elementos': response.json()
                 })
-        except:
+
+        except Exception:
             pass
 
-        # Si la API falla → usar respaldo
+        elementos_locales = cargar_elementos_locales()
+
         return JsonResponse({
             'success': True,
-            'elementos': obtener_elementos_respaldo()
+            'elementos': elementos_locales
         })
 
-    # -------------------------
-    # 🔹 Render normal (HTML)
-    # -------------------------
+    # Render normal (HTML)
     try:
-        response = requests.get("https://periodic-table-api.herokuapp.com/elements", timeout=10)
+        response = requests.get("https://periodic-table-api.herokuapp.com/elements", timeout=5)
+
         if response.status_code == 200:
             elementos = response.json()
         else:
-            elementos = obtener_elementos_respaldo()
-    except:
-        elementos = obtener_elementos_respaldo()
+            elementos = cargar_elementos_locales()
+
+    except Exception:
+        elementos = cargar_elementos_locales()
 
     # Colores por categoría
     categorias_colores = {
@@ -2978,8 +3054,12 @@ def tabla_periodica(request):
         'actinide': '#FF9999',
     }
 
+    # 🔴 SOLUCIÓN AL ERROR None → convertir a JSON válido
+    elementos_json = json.dumps(elementos)
+
     return render(request, 'herramientas/tabla_periodica.html', {
         'elementos': elementos,
+        'elementos_json': elementos_json,  # versión segura para JS
         'categorias_colores': categorias_colores,
     })
 
@@ -3034,43 +3114,137 @@ def traductor_automatico(request):
         'idiomas': idiomas,
     })
 
+
+
+def obtener_definicion_wiktionary_mejorado(palabra, idioma):
+    """Obtener definición de Wiktionary con parsing mejorado"""
+    try:
+        if idioma == 'es':
+            url = f"https://es.wiktionary.org/wiki/{palabra}"
+        else:
+            url = f"https://en.wiktionary.org/wiki/{palabra}"
+
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        response = requests.get(url, timeout=5, headers=headers)
+
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.content, 'html.parser')
+            definiciones = []
+
+            if idioma == 'es':
+                # Buscar la sección de español
+                es_section = soup.find('span', {'id': 'Español'})
+                if es_section:
+                    ol = es_section.find_next('ol')
+                    if ol:
+                        for li in ol.find_all('li', recursive=False):
+                            text = li.get_text(strip=True)
+                            # Limpiar y filtrar
+                            if text and len(text) > 3 and not text.startswith('Ámbito:'):
+                                definiciones.append(text)
+            else:
+                # Para inglés, buscar definiciones en las listas ordenadas
+                for ol in soup.find_all('ol'):
+                    for li in ol.find_all('li'):
+                        text = li.get_text(strip=True)
+                        if text and len(text) > 3:
+                            definiciones.append(text)
+
+            return definiciones[:5] if definiciones else None
+    except Exception as e:
+        print(f"Error en Wiktionary: {e}")
+        return None
+
+
+
 # Diccionario integrado (usando API de DictionaryAPI)
+import json
+import os
+import requests
+from bs4 import BeautifulSoup
 from googletrans import Translator
+from django.conf import settings
+from django.contrib.auth.decorators import login_required
+from django.http import JsonResponse
+from django.shortcuts import render
+
 @login_required
 def diccionario_integrado(request):
-    """Diccionario usando API de Datamuse y traducción"""
+    """
+    Diccionario con múltiples fuentes: local + Datamuse + Wiktionary + Google Translate
+    """
+    # Cargar datos locales (sinónimos/antónimos comunes)
+    def cargar_datos_locales(palabra, tipo):
+        json_path = os.path.join(settings.BASE_DIR, 'static', 'data', 'sinonimos.json')
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                datos = json.load(f)
+                if palabra in datos:
+                    if tipo == 'sinonimos':
+                        return datos[palabra].get('sinonimos', [])
+                    elif tipo == 'antonimos':
+                        return datos[palabra].get('antonimos', [])
+        except Exception:
+            pass
+        return None
+
+    # Si es petición POST AJAX
     if request.method == 'POST' and request.headers.get('X-Requested-With') == 'XMLHttpRequest':
         palabra = request.POST.get('palabra', '').strip().lower()
         idioma = request.POST.get('idioma', 'es')
-        tipo = request.POST.get('tipo', 'definicion')  # 'definicion', 'sinonimos', 'antonimos'
-        
+        tipo = request.POST.get('tipo', 'definicion')
+
         try:
+            # 1. Buscar en datos locales (solo para sinónimos/antónimos)
+            if tipo in ['sinonimos', 'antonimos']:
+                locales = cargar_datos_locales(palabra, tipo)
+                if locales:
+                    return JsonResponse({
+                        'success': True,
+                        'palabra': palabra,
+                        'resultados': locales,
+                        'tipo': tipo,
+                        'fuente': 'Base local'
+                    })
+
+            # 2. Usar Datamuse para sinónimos/antónimos
+            if tipo == 'sinonimos':
+                url = f"https://api.datamuse.com/words?rel_syn={palabra}&max=10"
+                if idioma == 'es':
+                    url += "&lang=es"
+                response = requests.get(url, timeout=5)
+                if response.status_code == 200:
+                    data = response.json()
+                    resultados = [item['word'] for item in data]
+                    if resultados:
+                        return JsonResponse({
+                            'success': True,
+                            'palabra': palabra,
+                            'resultados': resultados,
+                            'tipo': 'sinónimos',
+                            'fuente': 'Datamuse API'
+                        })
+
+            if tipo == 'antonimos':
+                url = f"https://api.datamuse.com/words?rel_ant={palabra}&max=10"
+                if idioma == 'es':
+                    url += "&lang=es"
+                response = requests.get(url, timeout=5)
+                if response.status_code == 200:
+                    data = response.json()
+                    resultados = [item['word'] for item in data]
+                    if resultados:
+                        return JsonResponse({
+                            'success': True,
+                            'palabra': palabra,
+                            'resultados': resultados,
+                            'tipo': 'antónimos',
+                            'fuente': 'Datamuse API'
+                        })
+
+            # 3. Para definiciones, intentar Wiktionary primero
             if tipo == 'definicion':
-                # Usar Datamuse para definiciones (en inglés principalmente)
-                if idioma == 'en':
-                    # Para inglés, usar Datamuse
-                    url = f"https://api.datamuse.com/words?sp={palabra}&md=d&max=5"
-                    response = requests.get(url, timeout=5)
-                    
-                    if response.status_code == 200:
-                        data = response.json()
-                        definiciones = []
-                        
-                        for item in data:
-                            if 'defs' in item:
-                                for definicion in item['defs'][:3]:
-                                    definiciones.append(definicion)
-                        
-                        if definiciones:
-                            return JsonResponse({
-                                'success': True,
-                                'palabra': palabra,
-                                'definiciones': definiciones,
-                                'fuente': 'Datamuse API'
-                            })
-                
-                # Para español o si Datamuse no funciona, usar Wiktionary web scraping
-                definiciones = obtener_definicion_wiktionary(palabra, idioma)
+                definiciones = obtener_definicion_wiktionary_mejorado(palabra, idioma)
                 if definiciones:
                     return JsonResponse({
                         'success': True,
@@ -3078,128 +3252,52 @@ def diccionario_integrado(request):
                         'definiciones': definiciones,
                         'fuente': 'Wiktionary'
                     })
-                
-                # Si no hay resultados, intentar traducción
+
+                # 4. Si no, buscar en un diccionario local (solo español)
+                if idioma == 'es':
+                    definiciones_locales = {
+                        'estudio': [
+                            'Esfuerzo que pone el entendimiento aplicándose a conocer algo.',
+                            'Obra en que un autor estudia y trata una materia.',
+                            'Habitación donde se estudia.'
+                        ],
+                        'casa': ['Edificio para habitar.', 'Familia o linaje.'],
+                        # Agrega más palabras comunes aquí
+                    }
+                    if palabra in definiciones_locales:
+                        return JsonResponse({
+                            'success': True,
+                            'palabra': palabra,
+                            'definiciones': definiciones_locales[palabra],
+                            'fuente': 'Diccionario local'
+                        })
+
+                # 5. Finalmente, recurrir a Google Translate
                 translator = Translator()
-                traduccion = translator.translate(palabra, src=idioma, dest='en')
+                traduccion = translator.translate(palabra, src=idioma, dest='es' if idioma != 'es' else 'en')
                 return JsonResponse({
                     'success': True,
                     'palabra': palabra,
-                    'definiciones': [f"Traducción al inglés: {traduccion.text}"],
+                    'definiciones': [f"Traducción: {traduccion.text}"],
                     'fuente': 'Google Translate'
                 })
-            
-            elif tipo == 'sinonimos':
-                # Usar Datamuse para sinónimos
-                if idioma == 'es':
-                    url = f"https://api.datamuse.com/words?rel_syn={palabra}&lang=es&max=10"
-                else:
-                    url = f"https://api.datamuse.com/words?rel_syn={palabra}&max=10"
-                
-                response = requests.get(url, timeout=5)
-                if response.status_code == 200:
-                    data = response.json()
-                    sinonimos = [item['word'] for item in data[:8]]
-                    
-                    if sinonimos:
-                        return JsonResponse({
-                            'success': True,
-                            'palabra': palabra,
-                            'resultados': sinonimos,
-                            'tipo': 'sinónimos'
-                        })
-                
-                # Si no hay sinónimos, sugerir palabras similares
-                url_similar = f"https://api.datamuse.com/words?ml={palabra}&max=8"
-                response = requests.get(url_similar, timeout=5)
-                if response.status_code == 200:
-                    data = response.json()
-                    similares = [item['word'] for item in data[:6]]
-                    
-                    return JsonResponse({
-                        'success': True,
-                        'palabra': palabra,
-                        'resultados': similares,
-                        'tipo': 'palabras similares',
-                        'nota': 'No se encontraron sinónimos exactos, aquí hay palabras relacionadas:'
-                    })
-            
-            elif tipo == 'antonimos':
-                # Usar Datamuse para antónimos
-                if idioma == 'es':
-                    url = f"https://api.datamuse.com/words?rel_ant={palabra}&lang=es&max=10"
-                else:
-                    url = f"https://api.datamuse.com/words?rel_ant={palabra}&max=10"
-                
-                response = requests.get(url, timeout=5)
-                if response.status_code == 200:
-                    data = response.json()
-                    antonimos = [item['word'] for item in data[:8]]
-                    
-                    if antonimos:
-                        return JsonResponse({
-                            'success': True,
-                            'palabra': palabra,
-                            'resultados': antonimos,
-                            'tipo': 'antónimos'
-                        })
-                
-                # Si no hay antónimos, buscar palabras opuestas por significado
-                return JsonResponse({
-                    'success': False,
-                    'error': f'No se encontraron antónimos directos para "{palabra}"'
-                })
-                
+
+            # Si llegamos aquí, no se encontró nada para sinónimos/antónimos
+            return JsonResponse({
+                'success': False,
+                'error': f'No se encontraron {tipo} para "{palabra}"'
+            })
+
         except Exception as e:
             return JsonResponse({
                 'success': False,
                 'error': str(e),
-                'sugerencia': 'Intenta con otra palabra o verifica la conexión a internet.'
+                'sugerencia': 'Intenta con otra palabra o verifica la conexión.'
             })
-    
+
+    # Si es GET normal, renderizar el template
     return render(request, 'herramientas/diccionario_integrado.html')
 
-def obtener_definicion_wiktionary(palabra, idioma):
-    """Obtener definición de Wiktionary usando web scraping"""
-    try:
-        if idioma == 'es':
-            url = f"https://es.wiktionary.org/wiki/{palabra}"
-        else:
-            url = f"https://en.wiktionary.org/wiki/{palabra}"
-        
-        response = requests.get(url, timeout=5)
-        
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.content, 'html.parser')
-            definiciones = []
-            
-            # Buscar definiciones en español
-            if idioma == 'es':
-                for ol in soup.find_all('ol'):
-                    for li in ol.find_all('li'):
-                        text = li.get_text(strip=True)
-                        if len(text) > 10 and not text.startswith('(Figurado)') and not text.startswith('Sinónimo'):
-                            definiciones.append(text)
-            else:
-                # Buscar definiciones en inglés
-                for span in soup.find_all('span', {'class': 'mw-headline'}):
-                    if span.text in ['Etymology', 'Pronunciation']:
-                        continue
-                    parent = span.parent
-                    if parent.name == 'h3' or parent.name == 'h4':
-                        next_elem = parent.find_next_sibling()
-                        while next_elem and next_elem.name not in ['h3', 'h4']:
-                            if next_elem.name == 'ol':
-                                for li in next_elem.find_all('li'):
-                                    text = li.get_text(strip=True)
-                                    if text:
-                                        definiciones.append(text)
-                            next_elem = next_elem.find_next_sibling()
-            
-            return definiciones[:5] if definiciones else None
-            
-    except:
-        return None
 
 # Sinónimos y antónimos
 @login_required
@@ -3837,7 +3935,7 @@ def editar_perfil_alumno(request):
     )
 
 
-
+########### ADMIN Acciones ################
 
 def admin_required(function=None):
     """Decorator para verificar si el usuario es administrador"""
@@ -3860,7 +3958,14 @@ def admin_required(function=None):
     return decorator
 
 
-# MUEVE el decorador admin_required ANTES de las vistas que lo usan
+from django.shortcuts import render, redirect
+from django.contrib import messages
+from django.db.models import Count, Sum
+from datetime import datetime
+
+from django.db.models.functions import Coalesce
+from django.db.models import Value
+
 @admin_required
 def dashboard_admin(request):
     """Dashboard principal del administrador"""
@@ -3870,55 +3975,160 @@ def dashboard_admin(request):
         total_alumnos = Alumno.objects.count()
         total_maestros = Maestro.objects.count()
         total_clases = SolicitudClase.objects.count()
-        
+
+        # Solicitudes activas
+        solicitudes_activas = SolicitudClase.objects.filter(
+            estado='pendiente'
+        ).count()
+
+        # Usuarios por rol
+        usuarios_por_rol = Usuario.objects.values('rol').annotate(
+            total=Count('id')
+        )
+
         # Clases por estado
         clases_por_estado = SolicitudClase.objects.values('estado').annotate(
             total=Count('id')
         ).order_by('-total')
-        
+
         # Ingresos totales
         ingresos_totales = SolicitudClase.objects.filter(
             estado_pago='pagado'
-        ).aggregate(Sum('monto_final'))['monto_final__sum'] or 0
-        
+        ).aggregate(
+            total=Sum(Coalesce('monto_final', 'monto_acordado', output_field=models.DecimalField()))
+        )['total'] or 0
+
         # Usuarios nuevos este mes
-        from datetime import datetime
-        primer_dia_mes = datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        primer_dia_mes = datetime.now().replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0
+        )
+
         nuevos_usuarios_mes = Usuario.objects.filter(
             fecha_creacion__gte=primer_dia_mes
         ).count()
-        
+
         # Materias más populares
         from catalogo.models import Materia
+
         materias_populares = Materia.objects.annotate(
             total_clases=Count('solicitudclase'),
             total_maestros=Count('maestros')
         ).order_by('-total_clases')[:10]
-        
+
         context = {
             'total_usuarios': total_usuarios,
             'total_alumnos': total_alumnos,
             'total_maestros': total_maestros,
             'total_clases': total_clases,
+            'solicitudes_activas': solicitudes_activas,
+            'usuarios_por_rol': usuarios_por_rol,
             'clases_por_estado': clases_por_estado,
             'ingresos_totales': ingresos_totales,
             'nuevos_usuarios_mes': nuevos_usuarios_mes,
             'materias_populares': materias_populares,
         }
-        
+
         return render(request, 'admin/dashboard_admin.html', context)
-    
+
     except Exception as e:
         messages.error(request, f"Error al cargar el dashboard: {str(e)}")
         return redirect('home')    
 
 
 
+from django.db.models import Count, Sum, Avg, Q
+from django.utils import timezone
+from datetime import timedelta
+
+from django.db.models.functions import Coalesce
+from django.db.models import DecimalField
+
 @admin_required
 def estadisticas_detalladas(request):
-    """Estadísticas detalladas del sistema"""
-    # Aquí va el código completo de estadisticas_detalladas que te pasé antes
-    # ... (usa el código completo que te proporcioné en la respuesta anterior)
+    ahora = timezone.now()
+    año_seleccionado = request.GET.get('año', ahora.year)
+    try:
+        año_seleccionado = int(año_seleccionado)
+    except:
+        año_seleccionado = ahora.year
+
+    total_usuarios = Usuario.objects.count()
+    total_clases = SolicitudClase.objects.count()
+    solicitudes_activas = SolicitudClase.objects.filter(estado='pendiente').count()
+
+    usuarios_por_rol = Usuario.objects.values('rol').annotate(total=Count('id'))
+
+    # Datos para gráficos: 12 meses del año seleccionado
+    meses = []
+    usuarios_mes = []
+    ingresos_mes = []
+    from datetime import datetime
+    for mes in range(1, 13):
+        fecha_inicio = datetime(año_seleccionado, mes, 1, tzinfo=timezone.get_current_timezone())
+        if mes == 12:
+            fecha_fin = datetime(año_seleccionado+1, 1, 1, tzinfo=timezone.get_current_timezone())
+        else:
+            fecha_fin = datetime(año_seleccionado, mes+1, 1, tzinfo=timezone.get_current_timezone())
+        meses.append(fecha_inicio.strftime('%b %Y'))
+
+        usuarios_mes.append(
+            Usuario.objects.filter(date_joined__gte=fecha_inicio, date_joined__lt=fecha_fin).count()
+        )
+
+        ingresos = SolicitudClase.objects.filter(
+            estado_pago='pagado',
+            fecha_pago__gte=fecha_inicio,
+            fecha_pago__lt=fecha_fin
+        ).aggregate(
+            total=Sum(Coalesce('monto_final', 'monto_acordado', output_field=models.DecimalField()))
+        )['total'] or 0
+
+        ingresos_mes.append(float(ingresos))
+
+    clases_por_estado = list(SolicitudClase.objects.values('estado').annotate(total=Count('id')))
+    for item in clases_por_estado:
+        item['porcentaje'] = round((item['total'] / total_clases) * 100, 1) if total_clases else 0
+
+    años_disponibles = Usuario.objects.dates('date_joined', 'year').distinct()
+    años_list = [f.year for f in años_disponibles]
+    if not años_list:
+        años_list = [ahora.year]
+
+    exportar = request.GET.get('exportar')
+
+    if exportar == 'csv':
+        return exportar_estadisticas_csv(
+            request, año_seleccionado, meses, usuarios_mes, ingresos_mes,
+            clases_por_estado, total_usuarios, total_clases, solicitudes_activas
+        )
+
+    elif exportar == 'excel':
+        return exportar_estadisticas_excel(
+            request, año_seleccionado, meses, usuarios_mes, ingresos_mes,
+            clases_por_estado, total_usuarios, total_clases, solicitudes_activas
+        )
+
+    elif exportar == 'pdf':
+        return exportar_estadisticas_pdf(
+            request, año_seleccionado, meses, usuarios_mes, ingresos_mes,
+            clases_por_estado, total_usuarios, total_clases, solicitudes_activas
+        )
+    
+
+
+    context = {
+        'total_usuarios': total_usuarios,
+        'total_clases': total_clases,
+        'solicitudes_activas': solicitudes_activas,
+        'usuarios_por_rol': usuarios_por_rol,
+        'meses': meses,
+        'usuarios_mes': usuarios_mes,
+        'ingresos_mes': ingresos_mes,
+        'clases_por_estado': clases_por_estado,
+        'años_disponibles': años_list,
+        'año_seleccionado': año_seleccionado,
+    }
+    return render(request, 'admin/estadisticas_detalladas.html', context)
 
 
 @admin_required
@@ -3927,19 +4137,32 @@ def gestion_promociones(request):
     promociones = Promocion.objects.all().order_by('-fecha_inicio')
     
     if request.method == 'POST':
-        form = PromocionForm(request.POST)
-        if form.is_valid():
-            form.save()
-            messages.success(request, 'Promoción creada correctamente.')
+        if 'crear' in request.POST:
+            form = PromocionForm(request.POST)
+            if form.is_valid():
+                form.save()
+                messages.success(request, 'Promoción creada correctamente.')
+                return redirect('gestion_promociones')
+        elif 'editar' in request.POST:
+            promo_id = request.POST.get('promocion_id')
+            promocion = get_object_or_404(Promocion, id=promo_id)
+            form = PromocionForm(request.POST, instance=promocion)
+            if form.is_valid():
+                form.save()
+                messages.success(request, 'Promoción actualizada.')
+                return redirect('gestion_promociones')
+        elif 'eliminar' in request.POST:
+            promo_id = request.POST.get('promocion_id')
+            promocion = get_object_or_404(Promocion, id=promo_id)
+            promocion.delete()
+            messages.success(request, 'Promoción eliminada.')
             return redirect('gestion_promociones')
-    else:
-        form = PromocionForm()
     
+    form = PromocionForm()
     return render(request, 'admin/gestion_promociones.html', {
         'promociones': promociones,
-        'form': form
+        'form': form,
     })
-
 
 @admin_required
 def gestion_vouchers(request):
@@ -3947,17 +4170,153 @@ def gestion_vouchers(request):
     vouchers = Voucher.objects.all().order_by('-fecha_creacion')
     
     if request.method == 'POST':
-        form = VoucherForm(request.POST)
-        if form.is_valid():
-            form.save()
-            messages.success(request, 'Voucher creado correctamente.')
+        if 'crear' in request.POST:
+            form = VoucherForm(request.POST)
+            if form.is_valid():
+                form.save()
+                messages.success(request, 'Voucher creado correctamente.')
+                return redirect('gestion_vouchers')
+        elif 'marcar_usado' in request.POST:
+            voucher_id = request.POST.get('voucher_id')
+            voucher = get_object_or_404(Voucher, id=voucher_id)
+            voucher.usado = True
+            voucher.fecha_uso = timezone.now()
+            voucher.save()
+            messages.success(request, 'Voucher marcado como usado.')
             return redirect('gestion_vouchers')
-    else:
-        form = VoucherForm()
+        elif 'eliminar' in request.POST:
+            voucher_id = request.POST.get('voucher_id')
+            voucher = get_object_or_404(Voucher, id=voucher_id)
+            voucher.delete()
+            messages.success(request, 'Voucher eliminado.')
+            return redirect('gestion_vouchers')
     
+    form = VoucherForm()
     return render(request, 'admin/gestion_vouchers.html', {
         'vouchers': vouchers,
-        'form': form
+        'form': form,
+    })
+
+from django.core.paginator import Paginator
+from django.db.models import Q
+
+@admin_required
+def lista_usuarios_admin(request):
+    """Lista todos los usuarios"""
+    
+    usuarios = Usuario.objects.all().order_by('-date_joined')
+
+    # Filtro por rol
+    rol = request.GET.get('rol')
+    if rol:
+        usuarios = usuarios.filter(rol=rol)
+
+    # Búsqueda
+    busqueda = request.GET.get('q')
+    if busqueda:
+        usuarios = usuarios.filter(
+            Q(username__icontains=busqueda) |
+            Q(email__icontains=busqueda) |
+            Q(nombre__icontains=busqueda) |
+            Q(apellido__icontains=busqueda)
+        )
+
+    # Paginación
+    paginator = Paginator(usuarios, 20)  # 20 usuarios por página
+    page = request.GET.get('page')
+    usuarios_paginados = paginator.get_page(page)
+
+    return render(request, 'admin/lista_usuarios.html', {
+        'usuarios': usuarios_paginados,
+        'rol_seleccionado': rol,
+        'busqueda': busqueda,
+    })
+
+from django.shortcuts import get_object_or_404, redirect, render
+from django.contrib import messages
+from django.db.models import Q
+
+@admin_required
+def detalle_usuario_admin(request, usuario_id):
+    """Ver perfil de un usuario específico"""
+    
+    usuario = get_object_or_404(Usuario, id=usuario_id)
+
+    # Obtener perfil según rol
+    perfil = None
+    if usuario.rol == 'ALUMNO':
+        perfil = Alumno.objects.filter(usuario=usuario).first()
+    elif usuario.rol == 'MAESTRO':
+        perfil = Maestro.objects.filter(usuario=usuario).first()
+
+    # Últimas solicitudes
+    solicitudes = SolicitudClase.objects.filter(
+        Q(alumno__usuario=usuario) | Q(maestro__usuario=usuario)
+    ).order_by('-fecha_solicitud')[:10]
+
+    return render(request, 'admin/detalle_usuario.html', {
+        'usuario': usuario,
+        'perfil': perfil,
+        'solicitudes': solicitudes,
+    })
+
+
+@admin_required
+def editar_usuario(request, usuario_id):
+    usuario = get_object_or_404(Usuario, id=usuario_id)
+    if request.method == 'POST':
+        usuario.nombre = request.POST.get('nombre', usuario.nombre)
+        usuario.apellido = request.POST.get('apellido', usuario.apellido)
+        usuario.email = request.POST.get('email', usuario.email)
+        # Capturar el checkbox (envía 'on' si está marcado)
+        usuario.verificado = request.POST.get('verificado') == 'on'
+        usuario.save()
+        messages.success(request, 'Usuario actualizado correctamente.')
+        return redirect('detalle_usuario_admin', usuario_id=usuario.id)
+    return render(request, 'admin/editar_usuario.html', {'usuario': usuario})
+
+
+@admin_required
+def eliminar_usuario(request, usuario_id):
+    """Eliminar usuario"""
+
+    usuario = get_object_or_404(Usuario, id=usuario_id)
+
+    usuario.delete()
+
+    messages.success(request, 'Usuario eliminado correctamente.')
+    return redirect('lista_usuarios_admin')
+
+
+@admin_required
+def bloquear_usuario(request, usuario_id):
+    usuario = get_object_or_404(Usuario, id=usuario_id)
+    # Alternar estado
+    usuario.is_active = not usuario.is_active
+    usuario.save()
+    estado = "bloqueado" if not usuario.is_active else "activado"
+    messages.success(request, f'Usuario {estado} correctamente.')
+    return redirect('lista_usuarios_admin')
+
+
+@admin_required
+def asignar_rol(request, usuario_id):
+    """Cambiar rol del usuario"""
+
+    usuario = get_object_or_404(Usuario, id=usuario_id)
+
+    if request.method == 'POST':
+        nuevo_rol = request.POST.get('rol')
+
+        if nuevo_rol in ['ADMIN', 'ALUMNO', 'MAESTRO']:
+            usuario.rol = nuevo_rol
+            usuario.save()
+            messages.success(request, 'Rol actualizado correctamente.')
+
+        return redirect('detalle_usuario_admin', usuario_id=usuario.id)
+
+    return render(request, 'admin/asignar_rol.html', {
+        'usuario': usuario
     })
 
 
@@ -3975,5 +4334,220 @@ def admin_required(function=None):
     if function:
         return actual_decorator(function)
     return actual_decorator
+
+
+@admin_required
+def editar_promocion(request, promocion_id):
+    promocion = get_object_or_404(Promocion, id=promocion_id)
+    if request.method == 'POST':
+        form = PromocionForm(request.POST, instance=promocion)
+        if form.is_valid():
+            form.save()
+            messages.success(request, 'Promoción actualizada correctamente.')
+            return redirect('gestion_promociones')
+    else:
+        form = PromocionForm(instance=promocion)
+    return render(request, 'admin/editar_promocion.html', {'form': form, 'promocion': promocion})
+
+
+@login_required
+def nuevo_ticket_soporte(request):
+    """Permite a cualquier usuario enviar un ticket de soporte"""
+    if request.method == 'POST':
+        asunto = request.POST.get('asunto')
+        mensaje = request.POST.get('mensaje')
+        if asunto and mensaje:
+            ticket = TicketSoporte.objects.create(
+                remitente=request.user,
+                asunto=asunto,
+                mensaje=mensaje
+            )
+            messages.success(request, 'Ticket enviado correctamente. Pronto recibirás respuesta.')
+            # Notificar a todos los admins
+            admins = Usuario.objects.filter(rol='ADMIN')
+            for admin in admins:
+                crear_notificacion(
+                    usuario=admin,
+                    tipo='solicitud',
+                    mensaje=f'Nuevo ticket de {request.user.get_full_name()}: {asunto}',
+                    enlace=f'/admin/soporte/{ticket.id}/'
+                )
+            return redirect('home')
+        else:
+            messages.error(request, 'Debes completar asunto y mensaje.')
+    return render(request, 'soporte/nuevo_ticket.html')
+
+@admin_required
+def lista_tickets_admin(request):
+    """Lista todos los tickets para el admin"""
+    tickets = TicketSoporte.objects.all().order_by('-fecha_creacion')
+    estado = request.GET.get('estado')
+    if estado:
+        tickets = tickets.filter(estado=estado)
+    return render(request, 'admin/lista_tickets.html', {
+        'tickets': tickets,
+        'estado_seleccionado': estado,
+    })
+
+@admin_required
+def detalle_ticket_admin(request, ticket_id):
+    """Ver y responder un ticket"""
+    ticket = get_object_or_404(TicketSoporte, id=ticket_id)
+    if request.method == 'POST':
+        respuesta = request.POST.get('respuesta')
+        if respuesta:
+            ticket.respuesta = respuesta
+            ticket.estado = 'resuelto'
+            ticket.fecha_respuesta = timezone.now()
+            ticket.respondido_por = request.user
+            ticket.save()
+            # Notificar al remitente
+            crear_notificacion(
+                usuario=ticket.remitente,
+                tipo='solicitud',
+                mensaje=f'Tu ticket "{ticket.asunto}" ha sido respondido.',
+                enlace='#'  # Podrías crear una vista para que el usuario vea la respuesta
+            )
+            messages.success(request, 'Respuesta enviada correctamente.')
+            return redirect('lista_tickets_admin')
+    return render(request, 'admin/detalle_ticket.html', {'ticket': ticket})
+
+
+import csv
+from django.http import HttpResponse
+
+def exportar_estadisticas_csv(request, año, meses, usuarios_mes, ingresos_mes, clases_por_estado, total_usuarios, total_clases, solicitudes_activas):
+    response = HttpResponse(content_type='text/csv')
+    response['Content-Disposition'] = f'attachment; filename="estadisticas_{año}.csv"'
+    writer = csv.writer(response)
+    
+    writer.writerow(['Estadísticas EduLink', f'Año {año}'])
+    writer.writerow(['Total usuarios', total_usuarios])
+    writer.writerow(['Total clases', total_clases])
+    writer.writerow(['Solicitudes activas', solicitudes_activas])
+    writer.writerow([])
+    
+    writer.writerow(['Mes', 'Usuarios nuevos', 'Ingresos ($)'])
+    # Tomar el mínimo de las longitudes para evitar errores
+    min_len = min(len(meses), len(usuarios_mes), len(ingresos_mes))
+    for i in range(min_len):
+        writer.writerow([meses[i], usuarios_mes[i], ingresos_mes[i]])
+    
+    writer.writerow([])
+    writer.writerow(['Clases por estado', 'Cantidad'])
+    for item in clases_por_estado:
+        writer.writerow([item['estado'], item['total']])
+    
+    return response
+
+
+from openpyxl import Workbook
+from django.http import HttpResponse
+
+def exportar_estadisticas_excel(request, año, meses, usuarios_mes, ingresos_mes,
+                                clases_por_estado, total_usuarios, total_clases, solicitudes_activas):
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Estadísticas"
+
+    # Título
+    ws.append([f"Estadísticas del año {año}"])
+    ws.append([])
+
+    # Resumen
+    ws.append(["Resumen"])
+    ws.append(["Total usuarios", total_usuarios])
+    ws.append(["Total clases", total_clases])
+    ws.append(["Solicitudes activas", solicitudes_activas])
+    ws.append([])
+
+    # Tabla mensual
+    ws.append(["Mes", "Usuarios nuevos", "Ingresos"])
+
+    for i in range(len(meses)):
+        ws.append([
+            meses[i],
+            usuarios_mes[i],
+            ingresos_mes[i]
+        ])
+
+    ws.append([])
+
+    # Clases por estado
+    ws.append(["Estado", "Cantidad", "Porcentaje"])
+
+    for estado in clases_por_estado:
+        ws.append([
+            estado['estado'],
+            estado['total'],
+            estado['porcentaje']
+        ])
+
+    # Response
+    response = HttpResponse(
+        content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    )
+    response['Content-Disposition'] = f'attachment; filename=estadisticas_{año}.xlsx'
+
+    wb.save(response)
+    return response
+
+
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet
+from django.http import HttpResponse
+
+def exportar_estadisticas_pdf(request, año, meses, usuarios_mes, ingresos_mes,
+                              clases_por_estado, total_usuarios, total_clases, solicitudes_activas):
+
+    response = HttpResponse(content_type='application/pdf')
+    response['Content-Disposition'] = f'attachment; filename=estadisticas_{año}.pdf'
+
+    doc = SimpleDocTemplate(response, pagesize=letter)
+    elements = []
+
+    styles = getSampleStyleSheet()
+
+    # Título
+    elements.append(Paragraph(f"Estadísticas del año {año}", styles['Title']))
+
+    # Resumen
+    resumen_data = [
+        ["Total usuarios", total_usuarios],
+        ["Total clases", total_clases],
+        ["Solicitudes activas", solicitudes_activas],
+    ]
+
+    tabla_resumen = Table(resumen_data)
+    tabla_resumen.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.grey),
+        ('GRID', (0,0), (-1,-1), 1, colors.black),
+    ]))
+
+    elements.append(tabla_resumen)
+
+    # Tabla mensual
+    data = [["Mes", "Usuarios", "Ingresos"]]
+
+    for i in range(len(meses)):
+        data.append([
+            meses[i],
+            usuarios_mes[i],
+            f"${ingresos_mes[i]}"
+        ])
+
+    tabla = Table(data)
+    tabla.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.lightblue),
+        ('GRID', (0,0), (-1,-1), 1, colors.black),
+    ]))
+
+    elements.append(tabla)
+
+    doc.build(elements)
+    return response
 
 
