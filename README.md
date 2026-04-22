@@ -105,7 +105,7 @@ Ciclo completo de solicitudes con estados rastreables:
 - Notificaciones por cada nuevo mensaje (en plataforma y por email).
 - Conversaciones iniciables desde el menú o desde el perfil del usuario.
 
-![Chat](assets/Chat-EduLink.png)
+![Chat](assets/Chat-Edulink1.png)
 
 ---
 
