@@ -84,6 +84,7 @@ urlpatterns = [
     # Notificaciones
     path('notificaciones/', views.obtener_notificaciones, name='obtener_notificaciones'),
     path('notificaciones/<int:notificacion_id>/leida/', views.marcar_notificacion_leida, name='marcar_notificacion_leida'),
+    path("notificaciones/", views.listar_notificaciones, name="listar_notificaciones"),
     
     # Calendario
     path('maestro/calendario/', views.calendario_maestro, name='calendario_maestro'),
@@ -191,7 +192,8 @@ urlpatterns = [
     path("soporte/nuevo/", views.nuevo_ticket_soporte, name="nuevo_ticket_soporte"),
     path("admin/soporte/", views.lista_tickets_admin, name="lista_tickets_admin"),
     path("admin/soporte/<int:ticket_id>/", views.detalle_ticket_admin, name="detalle_ticket_admin"),
-    
+    path("soporte/mis-tickets/", views.mis_tickets, name="mis_tickets"),
+
     # URLs para gestión de usuarios por parte del admin
     path('admin/usuario/<int:usuario_id>/editar/', views.editar_usuario, name='editar_usuario'),
     path('admin/usuario/<int:usuario_id>/eliminar/', views.eliminar_usuario, name='eliminar_usuario'),
